@@ -2,10 +2,12 @@
   DJ Bop-It  —  Team 5 prototype
   Board: Arduino Nano (ATmega328P)
 
-  The game calls out a command ("Volume up!"), the player has a limited time
-  to do it, a ding plays on success and the next command comes a little
-  faster. A wrong input or running out of time ends the round and the score
-  is read out. Players take turns and try to beat the high score.
+  Background music plays while the game calls out commands ("Volume up!").
+  The player has a limited time to do it; each control has its own sound
+  (the air horn button plays an air horn) and the next command comes a
+  little faster. Every few points the music changes to a faster track.
+  A wrong input or running out of time ends the round and the score is
+  read out. Players take turns and try to beat the high score.
 
   Wiring (matches the schematic):
     D2  encoder CLK        D6  switch side 1   (switch common -> GND)
@@ -25,6 +27,13 @@
     /01/001..009   command voice lines, in the same order as CommandId
     /02/001..008   sound effects / announcer lines (see Sfx)
     /03/001..151   numbers 0..150 for the score readout (file = score + 1)
+    /04/001..004   background music, one track per level
+    /05/001..009   action sounds (air horn, bass drop...), same order as CommandId
+    /ADVERT/       copies of the commands (0001-0009) and action sounds (0011-0019)
+
+  The DFPlayer only plays one sound at a time. Files in /ADVERT are special:
+  playing one pauses the music, plays the clip, then resumes the music, so
+  commands and action sounds are played from there during a game.
 
   First power-up: set INPUT_TEST_MODE to 1. The voice asks for each control
   in turn ("Next one: Volume up!"), dings when it's right and tells you what
@@ -38,7 +47,7 @@
 // ------------------------------- Settings -------------------------------
 
 #define INPUT_TEST_MODE 0      // 1 = guided voice test of every input
-#define LAPTOP_AUDIO 1         // 1 = play sounds on the laptop via laptop_audio.py
+#define LAPTOP_AUDIO 0         // 1 = play sounds on the laptop via laptop_audio.py
                                //     instead of the DFPlayer (close Serial Monitor first)
 
 const int8_t  BUSY_PIN       = -1;   // set to 8 if DFPlayer BUSY is wired to D8
@@ -66,6 +75,14 @@ const unsigned long WAIT_INTRO_MS   = 2000;
 const unsigned long WAIT_SHORT_MS   = 800;
 const unsigned long WAIT_LONG_MS    = 2800;
 
+// Length of each action sound in /05, same order as CommandId (+ a little margin).
+const unsigned int ACTION_SOUND_MS[] = {950, 900, 450, 500, 500, 550, 550, 900, 900};
+
+// Music
+const uint8_t NUM_MUSIC_TRACKS = 4;
+const uint8_t POINTS_PER_LEVEL = 5;   // change track every this many points
+const unsigned long MUSIC_START_MS = 600;  // let a track start before overlaying clips
+
 // --------------------------------- Pins ---------------------------------
 
 const uint8_t PIN_ENC_CLK = 2;
@@ -84,6 +101,10 @@ const uint8_t PIN_SLIDER_B = A1;
 const uint8_t FOLDER_COMMANDS = 1;
 const uint8_t FOLDER_SFX      = 2;
 const uint8_t FOLDER_NUMBERS  = 3;
+const uint8_t FOLDER_MUSIC    = 4;
+const uint8_t FOLDER_ACTIONS  = 5;
+const uint8_t ADVERT_COMMAND_BASE = 1;   // /ADVERT/0001 = first command
+const uint8_t ADVERT_ACTION_BASE  = 11;  // /ADVERT/0011 = first action sound
 const int     MAX_SCORE_CLIP  = 150;
 
 enum Sfx : uint8_t {
@@ -101,7 +122,7 @@ enum Sfx : uint8_t {
   SFX_TEST_COMPLETE = 12,
 };
 
-// Order here = file order in /01 (001 = first entry).
+// Order here = file order in /01 and /05 (001 = first entry).
 enum CommandId : uint8_t {
   CMD_DROP_BEAT,    // button A
   CMD_AIR_HORN,     // button B
@@ -259,6 +280,48 @@ void playAndWait(uint8_t folder, uint8_t file, unsigned long fallbackMs) {
   while (digitalRead(BUSY_PIN) == LOW && millis() - start < 10000) {}
 }
 
+unsigned long overlayEndsAt = 0;
+
+// Starts a background track on repeat.
+void startMusic(uint8_t track) {
+#if LAPTOP_AUDIO
+  Serial.print(F("MUSIC "));
+  Serial.println(track);
+#else
+  mp3.playFolder(FOLDER_MUSIC, track);
+  delay(50);
+  mp3.enableLoop();
+#endif
+  overlayEndsAt = 0;
+  delay(MUSIC_START_MS);
+}
+
+// Plays /ADVERT/<number> over the music: the music pauses, then resumes.
+// Only works while music is playing.
+void playOverMusic(uint8_t number, unsigned long lengthMs) {
+#if LAPTOP_AUDIO
+  Serial.print(F("AD "));
+  Serial.println(number);
+#else
+  if (millis() < overlayEndsAt) {  // cut off the previous clip first
+    mp3.stopAdvertise();
+    delay(30);
+  }
+  mp3.advertise(number);
+#endif
+  overlayEndsAt = millis() + lengthMs;
+}
+
+void stopAudio() {
+#if LAPTOP_AUDIO
+  Serial.println(F("STOP"));
+#else
+  mp3.stop();
+#endif
+  overlayEndsAt = 0;
+  delay(100);
+}
+
 // --------------------------------- Game ---------------------------------
 
 unsigned long timeLimitFor(int score) {
@@ -318,6 +381,7 @@ void playGame() {
   int score = 0;
   lastCommand = CMD_NONE;
   playAndWait(FOLDER_SFX, SFX_INTRO, WAIT_INTRO_MS);
+  startMusic(1);
 
   while (true) {
     resetInputs();
@@ -330,7 +394,7 @@ void playGame() {
     Serial.println(F(" ms)"));
 
     // Timer starts with the voice line, so players can react as soon as they hear it.
-    play(FOLDER_COMMANDS, cmd + 1);
+    playOverMusic(ADVERT_COMMAND_BASE + cmd, WAIT_VOICE_MS);
     unsigned long start = millis();
     uint8_t input = CMD_NONE;
     while (input == CMD_NONE && millis() - start < limit) {
@@ -342,12 +406,22 @@ void playGame() {
         Serial.print(F("  got: "));
         Serial.println(COMMAND_NAMES[input]);
       }
+      stopAudio();
       gameOver(score, input == CMD_NONE);
       return;
     }
 
+    // Each control has its own sound: air horn, bass drop, scratch...
     score++;
-    playAndWait(FOLDER_SFX, SFX_SUCCESS, WAIT_SUCCESS_MS);
+    playOverMusic(ADVERT_ACTION_BASE + cmd, ACTION_SOUND_MS[cmd]);
+    delay(ACTION_SOUND_MS[cmd]);
+
+    if (score % POINTS_PER_LEVEL == 0) {
+      uint8_t track = (score / POINTS_PER_LEVEL) % NUM_MUSIC_TRACKS + 1;
+      Serial.print(F("Level up! Music track "));
+      Serial.println(track);
+      startMusic(track);
+    }
   }
 }
 
@@ -438,7 +512,7 @@ void inputTestLoop() {
   if (input == testTarget) {
     Serial.println(F("  correct!"));
     testDone[testTarget] = true;
-    playAndWait(FOLDER_SFX, SFX_SUCCESS, WAIT_SUCCESS_MS);
+    playAndWait(FOLDER_ACTIONS, testTarget + 1, ACTION_SOUND_MS[testTarget]);
     testTarget = CMD_NONE;
   } else if (input != CMD_NONE) {
     // Say what it actually detected, e.g. "That was... Tempo down!"
